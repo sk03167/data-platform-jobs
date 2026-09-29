@@ -1,10 +1,9 @@
-"""Standalone local version of the Open Brewery Bronze -> Silver -> Gold pipeline.
+"""AWS Glue version of the Open Brewery Bronze -> Silver -> Gold pipeline.
 
 Design improvements made while extracting this from the notebook:
 - The module is import-safe; execution happens only through main().
-- Spark setup is isolated in create_local_spark(), ready to be replaced by
-  Glue's managed Spark session later.
 - A caller supplies the batch ID, making a logical retry traceable.
+- Spark setup uses the session managed by AWS Glue.
 - Delta write and Gold-refresh helpers receive their Spark session and paths
   explicitly instead of relying on notebook globals.
 
@@ -12,42 +11,41 @@ Bronze and audit outputs use insert-only Delta MERGEs, so a retry with the same
 batch ID and source record ID becomes a no-op.
 """
 
-import argparse
+
 import logging
 import requests
-from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import DateType, DoubleType, StringType, StructField, StructType, TimestampType
-from delta import configure_spark_with_delta_pip
 from delta.tables import DeltaTable
+
+import sys
+
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
-def create_local_spark() -> SparkSession:
-    """Create the local Delta-enabled Spark session used by this standalone job."""
-    builder = (
-        SparkSession.builder
-        .appName("brewery-pipeline")
-        .master("local[2]")
-        .config("spark.sql.shuffle.partitions", "4")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-    )
-    spark_session = configure_spark_with_delta_pip(builder).getOrCreate()
+def create_glue_spark():
+    """Return the Spark session managed by an AWS Glue job."""
+    spark_context = SparkContext.getOrCreate()
+    glue_context = GlueContext(spark_context)
+    spark_session = glue_context.spark_session
     spark_session.sparkContext.setLogLevel("WARN")
-    return spark_session
+    return glue_context, spark_session
 
 #Pipeline Helpers
 def fetch_breweries(page: int, per_page: int) -> list[dict]:
     base_url = 'https://api.openbrewerydb.org/v1/breweries'
     headers = {"Content-Type":"application/json", "Accept":"application/json"}
-    params = {"page":page, "per_page":per_page}
+    params = {"page":page, "per_page":per_page, }
 
     try:
         response = requests.get(
-            url=base_url, headers=headers, params=params, timeout=5
+            url=base_url, headers=headers, params=params, timeout=30
         )
         response.raise_for_status()
         return response.json()
@@ -214,7 +212,7 @@ def refresh_gold(spark_session, curated_path: str, gold_path: str) -> None:
 # curated_df.printSchema()
 
 #Pipelein run definition
-def run_pipeline(spark_session, page: int, per_page: int, batch_id: str):
+def run_pipeline(spark_session, page: int, per_page: int, batch_id: str) -> dict[str, object]:
     records = fetch_breweries(page, per_page)
     bronze_df = to_bronze_df(spark_session,records,batch_id)
     null_report_df = profile_nulls(bronze_df)
@@ -236,13 +234,34 @@ def run_pipeline(spark_session, page: int, per_page: int, batch_id: str):
     # Then profile, validate, curate, and write outputs.
 
 #Pipeline Write helpers and main definition
-BRONZE_PATH = "s3://lead-de-dev-bronze-data/brewery_pipeline/bronze_breweries"
-QUARANTINE_PATH = "s3://lead-de-dev-bronze-data/brewery_pipeline/quarantined_breweries"
-NULL_REPORT_PATH = "s3://lead-de-dev-bronze-data/brewery_pipeline/null_reports"
-DUPLICATE_IDS_PATH = "s3://lead-de-dev-bronze-data/brewery_pipeline/duplicate_ids"
-
-CURATED_PATH = "s3://lead-de-dev-silver-data/brewery_pipeline/curated_breweries"
-GOLD_PATH = "s3://lead-de-dev-gold-data/brewery_pipeline/gold_brewery_summary"
+def build_paths(environment: str) -> dict[str, str]:
+    """Return the S3 Delta-table paths for one deployment environment."""
+    return {
+        "bronze": (
+            f"s3://lead-de-{environment}-bronze-data/"
+            "brewery_pipeline/bronze_breweries"
+        ),
+        "quarantine": (
+            f"s3://lead-de-{environment}-bronze-data/"
+            "brewery_pipeline/quarantined_breweries"
+        ),
+        "null_report": (
+            f"s3://lead-de-{environment}-bronze-data/"
+            "brewery_pipeline/null_reports"
+        ),
+        "duplicate_ids": (
+            f"s3://lead-de-{environment}-bronze-data/"
+            "brewery_pipeline/duplicate_ids"
+        ),
+        "curated": (
+            f"s3://lead-de-{environment}-silver-data/"
+            "brewery_pipeline/curated_breweries"
+        ),
+        "gold": (
+            f"s3://lead-de-{environment}-gold-data/"
+            "brewery_pipeline/gold_brewery_summary"
+        ),
+    }
 
 def merge_curated(spark_session, df, path: str) -> None:
     """Insert new curated breweries and refresh existing ones by ID."""
@@ -287,59 +306,62 @@ def merge_insert_only(
 def overwrite_to_delta(df, path: str)-> None:
     df.write.format('delta').mode('overwrite').option('overwriteSchema','True').save(path)
 
-def write_pipeline_outputs(spark_session, outputs: dict) -> None:
+def write_pipeline_outputs(spark_session, outputs: dict, paths: dict[str, str]) -> None:
     """Persist one completed pipeline run to Delta tables."""
 
     # Retry-safe raw/audit writes. The Open Brewery source supplies a stable id.
     merge_insert_only(
         spark_session,
         outputs["bronze"],
-        BRONZE_PATH,
+        paths["bronze"],
         "target.batch_id = source.batch_id AND target.id = source.id",
         partition_columns=["ingested_date"],
     )
     merge_insert_only(
         spark_session,
         outputs["quarantine"],
-        QUARANTINE_PATH,
+        paths["quarantine"],
         "target.batch_id = source.batch_id AND target.id = source.id",
     )
     merge_insert_only(
         spark_session,
         outputs["null_report"],
-        NULL_REPORT_PATH,
+        paths["null_report"],
         "target.batch_id = source.batch_id",
     )
     merge_insert_only(
         spark_session,
         outputs["duplicate_ids"],
-        DUPLICATE_IDS_PATH,
+        paths["duplicate_ids"],
         "target.batch_id = source.batch_id AND target.id = source.id",
     )
     # Merge curated breweries by id:
     # update existing IDs and insert new IDs.
-    merge_curated(spark_session, outputs["curated"], CURATED_PATH)
+    merge_curated(spark_session, outputs["curated"], paths["curated"])
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the local Open Brewery Delta pipeline.")
-    parser.add_argument("--page", type=int, default=1)
-    parser.add_argument("--per-page", type=int, default=10)
-    parser.add_argument(
-        "--batch-id",
-        required=True,
-        help="Stable logical run ID, for example 2026-09-29-page-1.",
+    args = getResolvedOptions(
+        sys.argv,
+        ["JOB_NAME", "environment", "page", "per_page", "batch_id"],
+
     )
-    args = parser.parse_args()
 
-    spark_session = create_local_spark()
-    try:
-        outputs = run_pipeline(spark_session, args.page, args.per_page, args.batch_id)
-        write_pipeline_outputs(spark_session, outputs)
-        refresh_gold(spark_session, CURATED_PATH, GOLD_PATH)
-        logging.info("Completed batch %s", outputs["batch_id"])
-    finally:
-        spark_session.stop()
+    glue_context, spark_session = create_glue_spark()
+    job = Job(glue_context)
+    job.init(args["JOB_NAME"], args)
 
+    outputs = run_pipeline(
+        spark_session,
+        page=int(args["page"]),
+        per_page=int(args["per_page"]),
+        batch_id=args["batch_id"],
+    )
+    paths = build_paths(args["environment"])
+    write_pipeline_outputs(spark_session, outputs, paths)
+    refresh_gold(spark_session, paths["curated"], paths["gold"])
+
+    logging.info("Completed batch %s", outputs["batch_id"])
+    job.commit()
 
 if __name__ == "__main__":
     main()
