@@ -34,3 +34,16 @@ jobs:
 
       - name: Test
         run: python -m pytest -q
+
+      - name: Build deployment artifacts
+        run: python -m build
+
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: glue-artifacts
+          path: |
+            dist/*.whl
+            glue/glue_job.py
+          if-no-files-found: error
+          retention-days: 7
