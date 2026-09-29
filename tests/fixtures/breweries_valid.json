@@ -1,0 +1,20 @@
+[
+  {
+    "id": "test-brewery-001",
+    "name": "Test Brewery",
+    "brewery_type": "micro",
+    "address_1": "1 Test Street",
+    "address_2": null,
+    "address_3": null,
+    "city": "Test City",
+    "state_province": "Test State",
+    "postal_code": "12345",
+    "country": "United States",
+    "longitude": -73.9857,
+    "latitude": 40.7484,
+    "phone": "5551234567",
+    "website_url": "https://example.com",
+    "state": "Test State",
+    "street": "1 Test Street"
+  }
+]
