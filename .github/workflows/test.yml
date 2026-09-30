@@ -4,10 +4,11 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - dev
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   test:
@@ -47,3 +48,30 @@ jobs:
             glue/glue_job.py
           if-no-files-found: error
           retention-days: 7
+
+      - name: Configure AWS credentials for artifact publishing
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::930628638871:role/lead-de-dev-jobs-artifact-publisher
+          aws-region: us-east-1
+          allowed-account-ids: "930628638871"
+          role-session-name: glue-artifact-publish-${{ github.run_id }}
+
+      - name: Publish immutable Glue artifacts
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        env:
+          ARTIFACT_BUCKET: lead-de-dev-artifacts
+        run: |
+          set -euo pipefail
+
+          artifact_prefix="s3://${ARTIFACT_BUCKET}/glue-artifacts/${GITHUB_SHA}"
+
+          if aws s3 ls "${artifact_prefix}/" | grep -q .; then
+            echo "Artifact path already exists: ${artifact_prefix}"
+            exit 1
+          fi
+
+          aws s3 cp dist/*.whl "${artifact_prefix}/"
+          aws s3 cp glue/glue_job.py "${artifact_prefix}/glue_job.py"
+          aws s3 ls "${artifact_prefix}/"
